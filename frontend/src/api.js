@@ -7,10 +7,10 @@ export async function api(path, { method = 'GET', body } = {}) {
   const res = await fetch(`${API_URL}/api${path}`, {
     method,
     headers: {
-      'Content-Type': 'application/json',
+      ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
       ...(token() ? { Authorization: 'Bearer ' + token() } : {})
     },
-    body: body ? JSON.stringify(body) : undefined,
+    body: body !== undefined ? JSON.stringify(body) : undefined,
   });
 
   if (res.status === 401 && token()) {
@@ -26,7 +26,14 @@ export async function api(path, { method = 'GET', body } = {}) {
   return data;
 }
 
-export const today = () => new Date().toISOString().slice(0, 10);
+export const today = () => {
+  const date = new Date();
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+
+  return `${year}-${month}-${day}`;
+};
 
 export const daysLeft = (exp) =>
   Math.round((new Date(exp) - new Date(today())) / 86400000);
