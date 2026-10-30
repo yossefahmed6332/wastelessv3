@@ -1,47 +1,62 @@
-"""WasteLess API - FastAPI + SQLite. Run: uvicorn main:app --reload"""
-import sqlite3, secrets, hashlib
+"""WasteLess API - FastAPI + Postgres (Neon). Run locally: uvicorn main:app --reload"""
+import os, secrets, hashlib
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from fastapi import FastAPI, Depends, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-DB = "wasteless.db"
+DATABASE_URL = os.environ.get("DATABASE_URL")  # Neon connection string (use the pooled one)
+
+# Allowed frontends: local dev + your Vercel URL(s), comma-separated in FRONTEND_URL
+origins = ["http://localhost:5173"] + [
+    o.strip().rstrip("/") for o in os.getenv("FRONTEND_URL", "").split(",") if o.strip()
+]
+
 app = FastAPI(title="WasteLess API")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "https://your-project.vercel.app"
-    ],
+    allow_origins=origins,
+    allow_origin_regex=r"https://.*\.vercel\.app" if os.getenv("ALLOW_VERCEL_PREVIEWS") else None,
     allow_methods=["*"],
-    allow_headers=["*"]
+    allow_headers=["*"],
 )
 
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS users(
+    id SERIAL PRIMARY KEY, name TEXT NOT NULL,
+    email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, salt TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS sessions(
+    token TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE);
+CREATE TABLE IF NOT EXISTS items(
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name TEXT NOT NULL, category TEXT NOT NULL, quantity DOUBLE PRECISION NOT NULL,
+    purchase_date TEXT, expiration_date TEXT NOT NULL);
+"""
+
+_ready = False  # schema is created once per server instance (works on serverless too)
+
 def get_db():
-    conn = sqlite3.connect(DB)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
+    global _ready
+    if not DATABASE_URL:
+        raise HTTPException(500, "DATABASE_URL is not configured")
+    conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
     try:
+        if not _ready:
+            with conn.cursor() as cur:
+                cur.execute(SCHEMA)
+            conn.commit()
+            _ready = True
         yield conn
     finally:
         conn.close()
 
-@app.on_event("startup")
-def init_db():
-    conn = sqlite3.connect(DB)
-    conn.executescript("""
-    CREATE TABLE IF NOT EXISTS users(
-        id INTEGER PRIMARY KEY, name TEXT NOT NULL,
-        email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, salt TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS sessions(
-        token TEXT PRIMARY KEY,
-        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE);
-    CREATE TABLE IF NOT EXISTS items(
-        id INTEGER PRIMARY KEY,
-        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        name TEXT NOT NULL, category TEXT NOT NULL, quantity REAL NOT NULL,
-        purchase_date TEXT, expiration_date TEXT NOT NULL);
-    """)
-    conn.commit(); conn.close()
+def run(conn, sql, args=()):
+    cur = conn.cursor()
+    cur.execute(sql, args)
+    return cur
 
 # ---------- auth ----------
 def hash_pw(password, salt):
@@ -49,8 +64,8 @@ def hash_pw(password, salt):
 
 def current_user(authorization: str = Header(None), conn=Depends(get_db)):
     token = (authorization or "").replace("Bearer ", "")
-    row = conn.execute("SELECT u.id, u.name, u.email FROM sessions s JOIN users u "
-                       "ON u.id = s.user_id WHERE s.token=?", (token,)).fetchone()
+    row = run(conn, "SELECT u.id, u.name, u.email FROM sessions s JOIN users u "
+                    "ON u.id = s.user_id WHERE s.token=%s", (token,)).fetchone()
     if not row:
         raise HTTPException(401, "Not authenticated")
     return dict(row)
@@ -66,33 +81,38 @@ class Login(BaseModel):
 
 def new_session(conn, user_id):
     token = secrets.token_hex(24)
-    conn.execute("INSERT INTO sessions VALUES (?,?)", (token, user_id))
+    run(conn, "INSERT INTO sessions(token, user_id) VALUES (%s,%s)", (token, user_id))
     conn.commit()
     return token
+
+@app.get("/api/health")
+def health():
+    return {"ok": True}
 
 @app.post("/api/register", status_code=201)
 def register(d: Register, conn=Depends(get_db)):
     if len(d.password) < 6:
         raise HTTPException(400, "Password must be at least 6 characters")
     email = d.email.strip().lower()
-    if conn.execute("SELECT 1 FROM users WHERE email=?", (email,)).fetchone():
+    if run(conn, "SELECT 1 FROM users WHERE email=%s", (email,)).fetchone():
         raise HTTPException(400, "Email already registered")
     salt = secrets.token_hex(8)
-    cur = conn.execute("INSERT INTO users(name,email,password_hash,salt) VALUES (?,?,?,?)",
-                       (d.name.strip(), email, hash_pw(d.password, salt), salt))
+    cur = run(conn, "INSERT INTO users(name,email,password_hash,salt) VALUES (%s,%s,%s,%s) RETURNING id",
+              (d.name.strip(), email, hash_pw(d.password, salt), salt))
+    user_id = cur.fetchone()["id"]
     conn.commit()
-    return {"token": new_session(conn, cur.lastrowid), "name": d.name.strip()}
+    return {"token": new_session(conn, user_id), "name": d.name.strip()}
 
 @app.post("/api/login")
 def login(d: Login, conn=Depends(get_db)):
-    u = conn.execute("SELECT * FROM users WHERE email=?", (d.email.strip().lower(),)).fetchone()
+    u = run(conn, "SELECT * FROM users WHERE email=%s", (d.email.strip().lower(),)).fetchone()
     if not u or hash_pw(d.password, u["salt"]) != u["password_hash"]:
         raise HTTPException(401, "Invalid email or password")
     return {"token": new_session(conn, u["id"]), "name": u["name"]}
 
 @app.post("/api/logout", status_code=204)
 def logout(authorization: str = Header(None), conn=Depends(get_db)):
-    conn.execute("DELETE FROM sessions WHERE token=?", ((authorization or "").replace("Bearer ", ""),))
+    run(conn, "DELETE FROM sessions WHERE token=%s", ((authorization or "").replace("Bearer ", ""),))
     conn.commit()
 
 # ---------- inventory ----------
@@ -105,25 +125,26 @@ class Item(BaseModel):
 
 @app.get("/api/items")
 def list_items(q: str = "", category: str = "", user=Depends(current_user), conn=Depends(get_db)):
-    sql, args = "SELECT * FROM items WHERE user_id=? AND name LIKE ?", [user["id"], f"%{q}%"]
+    sql, args = "SELECT * FROM items WHERE user_id=%s AND name ILIKE %s", [user["id"], f"%{q}%"]
     if category:
-        sql += " AND category=?"; args.append(category)
-    rows = conn.execute(sql + " ORDER BY expiration_date", args).fetchall()
+        sql += " AND category=%s"; args.append(category)
+    rows = run(conn, sql + " ORDER BY expiration_date", args).fetchall()
     return [dict(r) for r in rows]
 
 @app.post("/api/items", status_code=201)
 def add_item(i: Item, user=Depends(current_user), conn=Depends(get_db)):
-    cur = conn.execute("INSERT INTO items(user_id,name,category,quantity,purchase_date,expiration_date) "
-                       "VALUES (?,?,?,?,?,?)",
-                       (user["id"], i.name.strip(), i.category, i.quantity, i.purchase_date, i.expiration_date))
+    cur = run(conn, "INSERT INTO items(user_id,name,category,quantity,purchase_date,expiration_date) "
+                    "VALUES (%s,%s,%s,%s,%s,%s) RETURNING id",
+              (user["id"], i.name.strip(), i.category, i.quantity, i.purchase_date, i.expiration_date))
+    new_id = cur.fetchone()["id"]
     conn.commit()
-    return {"id": cur.lastrowid, **i.model_dump()}
+    return {"id": new_id, **i.model_dump()}
 
 @app.put("/api/items/{item_id}")
 def update_item(item_id: int, i: Item, user=Depends(current_user), conn=Depends(get_db)):
-    cur = conn.execute("UPDATE items SET name=?,category=?,quantity=?,purchase_date=?,expiration_date=? "
-                       "WHERE id=? AND user_id=?",
-                       (i.name.strip(), i.category, i.quantity, i.purchase_date, i.expiration_date, item_id, user["id"]))
+    cur = run(conn, "UPDATE items SET name=%s,category=%s,quantity=%s,purchase_date=%s,expiration_date=%s "
+                    "WHERE id=%s AND user_id=%s",
+              (i.name.strip(), i.category, i.quantity, i.purchase_date, i.expiration_date, item_id, user["id"]))
     conn.commit()
     if cur.rowcount == 0:
         raise HTTPException(404, "Item not found")
@@ -131,7 +152,7 @@ def update_item(item_id: int, i: Item, user=Depends(current_user), conn=Depends(
 
 @app.delete("/api/items/{item_id}", status_code=204)
 def delete_item(item_id: int, user=Depends(current_user), conn=Depends(get_db)):
-    cur = conn.execute("DELETE FROM items WHERE id=? AND user_id=?", (item_id, user["id"]))
+    cur = run(conn, "DELETE FROM items WHERE id=%s AND user_id=%s", (item_id, user["id"]))
     conn.commit()
     if cur.rowcount == 0:
         raise HTTPException(404, "Item not found")
