@@ -6,8 +6,15 @@ from pydantic import BaseModel
 
 DB = "wasteless.db"
 app = FastAPI(title="WasteLess API")
-app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173"],
-                   allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "https://your-project.vercel.app"
+    ],
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
 
 def get_db():
     conn = sqlite3.connect(DB)
